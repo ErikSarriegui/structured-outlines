@@ -4,7 +4,7 @@ A minimalist, zero-dependency library for **structured LLM generation**, designe
 
 ## 🌟 Why Structured Outlines?
 
-In many professional or academic environments, installing external dependencies is restricted due to security protocols. **Structured Outlines** was built to solve this by relying exclusively on the standard libraries already present in common ML environments (like `transformers`, `torch`, and `pydantic`).
+In many professional or academic environments, installing external dependencies is restricted due to security protocols. **Structured Outlines** was built to solve this by relying exclusively on the standard libraries already present in common ML environments (like `transformers`, `torch`, and `pydantic`) such as Google Colab.
 
 ### Key Strengths:
 * **Auditable in Minutes:** The entire core logic is contained in approximately **710 lines of code**. You can review every single line of the regex engine and logits processor before deployment.
