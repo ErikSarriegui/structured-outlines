@@ -33,6 +33,9 @@ class StructuredLogitsProcessor:
     ) -> "torch.FloatTensor":
         import torch
 
+        if input_ids.shape[0] != 1:
+            raise RuntimeError("StructuredLogitsProcessor requires batch_size == 1")
+
         # input_ids: (batch, seq_len)   scores: (batch, vocab)
         seq_len = input_ids.shape[-1]
 
@@ -139,4 +142,6 @@ def generate(
     )
 
     generated_ids = output[0, prompt_len:]
-    return tokenizer.decode(generated_ids, skip_special_tokens=True)
+    result = tokenizer.decode(generated_ids, skip_special_tokens=True)
+    schema.model_validate_json(result)
+    return result

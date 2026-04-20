@@ -20,13 +20,11 @@ from pydantic import BaseModel
 # ---------------------------------------------------------------------------
 
 # JSON string per RFC 8259.
-#   Body: any char except `"` and `\` (and control chars < 0x20 in strict JSON,
-#   which we don't exclude here to keep patterns compact — the LLM is very
-#   unlikely to emit raw control bytes inside a string token).
+#   Body: any char except `"`, `\`, and control chars (< 0x20).
 #   Escape: `\` followed by one of `" \ / b f n r t` or `uXXXX` (4 hex digits).
 _HEX = r"[0-9a-fA-F]"
 STRING = (
-    r'"([^"\\]|\\(["\\/bfnrt]|u' + _HEX + _HEX + _HEX + _HEX + r'))*"'
+    r'"([^"\\' + '\x00-\x1f' + r']|\\(["\\/bfnrt]|u' + _HEX + _HEX + _HEX + _HEX + r'))*"'
 )
 
 # JSON integer: 0 | optional-minus non-zero digits
@@ -127,8 +125,7 @@ def _convert(schema: dict, defs: dict, seen: frozenset = frozenset()) -> str:
     if schema_type == "object":
         return _object_pattern(schema, defs, seen)
 
-    # Fallback: treat unknown as string
-    return STRING
+    raise ValueError(f"Unsupported schema node: {schema}")
 
 
 def _array_pattern(schema: dict, defs: dict, seen: frozenset) -> str:
