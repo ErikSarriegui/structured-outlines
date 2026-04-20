@@ -1,4 +1,4 @@
-"""Minimal regex engine: regex string -> NFA (Thompson's) -> DFA (subset construction).
+"""Minimal regex engine: regex -> NFA (Thompson's) -> DFA (subset construction).
 
 Supports the regex subset needed for JSON schema patterns:
   - Literals with escaping (\\n, \\t, \\\\, \\", etc.)
@@ -7,15 +7,47 @@ Supports the regex subset needed for JSON schema patterns:
   - Alternation: |
   - Grouping: (...)
   - Dot: . (any char except newline)
+
+Transitions are represented symbolically: NFA edges carry (charset, negated)
+labels, and each DFA state has both explicit per-char transitions and an
+optional "default" transition covering any other char. This keeps the DFA
+small even when negated classes span Unicode.
 """
+
+from __future__ import annotations
 
 from collections import deque
 
 # ---------------------------------------------------------------------------
-# Character universe (printable ASCII + common whitespace)
+# Character universe (kept for backwards compatibility with AST helpers)
 # ---------------------------------------------------------------------------
 
 ALL_CHARS = frozenset(chr(i) for i in range(32, 127)) | frozenset("\t\n\r")
+
+# Default cap on the number of DFA states — protects against exponential
+# blow-up from adversarial regex/schema inputs.
+DEFAULT_MAX_STATES = 10_000
+
+# ---------------------------------------------------------------------------
+# Symbolic matchers
+# ---------------------------------------------------------------------------
+# A matcher is ``(chars: frozenset[str], negated: bool)``.
+# ``_m_matches(m, ch)`` is true iff ``(ch in chars) XOR negated``.
+# ``None`` on an NFA edge represents an epsilon transition.
+
+def _m_lit(ch: str):
+    return (frozenset((ch,)), False)
+
+def _m_cls(chars, negated: bool):
+    return (frozenset(chars), negated)
+
+def _m_dot():
+    # "." matches any char except newline.
+    return (frozenset(("\n",)), True)
+
+def _m_matches(matcher, ch: str) -> bool:
+    chars, negated = matcher
+    return (ch in chars) != negated
 
 # ---------------------------------------------------------------------------
 # AST nodes
@@ -31,10 +63,12 @@ class Literal:
 
 class CharClass:
     __slots__ = ("chars", "negated")
-    def __init__(self, chars: set, negated: bool = False):
-        self.chars = chars
+    def __init__(self, chars, negated: bool = False):
+        self.chars = frozenset(chars)
         self.negated = negated
     def matching_chars(self) -> frozenset:
+        # Retained for backwards compatibility. The DFA builder no longer
+        # enumerates characters — it keeps classes symbolic.
         return ALL_CHARS - self.chars if self.negated else frozenset(self.chars)
 
 class Dot:
@@ -81,13 +115,11 @@ def tokenize(pattern: str) -> list:
     while i < len(pattern):
         c = pattern[i]
         if c == "\\":
-            # Escaped character
             i += 1
             if i >= len(pattern):
                 raise ValueError("Trailing backslash in pattern")
             tokens.append(("LIT", _ESCAPE_MAP.get(pattern[i], pattern[i])))
         elif c == "[":
-            # Character class
             i += 1
             negated = False
             if i < len(pattern) and pattern[i] == "^":
@@ -105,7 +137,13 @@ def tokenize(pattern: str) -> list:
                     and pattern[i + 1] == "-"
                     and pattern[i + 2] != "]"
                 ):
-                    for code in range(ord(pattern[i]), ord(pattern[i + 2]) + 1):
+                    start_ch, end_ch = pattern[i], pattern[i + 2]
+                    if ord(start_ch) > ord(end_ch):
+                        raise ValueError(
+                            f"Invalid character range '{start_ch}-{end_ch}': "
+                            "start code point is greater than end"
+                        )
+                    for code in range(ord(start_ch), ord(end_ch) + 1):
                         chars.add(chr(code))
                     i += 2
                 else:
@@ -113,7 +151,6 @@ def tokenize(pattern: str) -> list:
                 i += 1
             if i >= len(pattern):
                 raise ValueError("Unterminated character class")
-            # i now points at ']'
             tokens.append(("CC", (chars, negated)))
         elif c == "(":
             tokens.append(("LPAR", None))
@@ -151,15 +188,11 @@ class _Parser:
         self.pos += 1
         return tok
 
-    # ── public ──
-
     def parse(self):
         node = self._alt()
         if self.pos != len(self.tokens):
             raise ValueError(f"Unexpected token at position {self.pos}: {self._peek()}")
         return node
-
-    # ── grammar rules ──
 
     def _alt(self):
         left = self._concat()
@@ -218,13 +251,13 @@ class _Parser:
         raise ValueError(f"Unexpected token: {tok}")
 
 # ---------------------------------------------------------------------------
-# NFA  (Thompson's construction)
+# NFA (Thompson's construction) — edges carry symbolic matchers
 # ---------------------------------------------------------------------------
 
 class _NFA:
     def __init__(self):
         self.size = 0
-        self.trans: dict[int, list[tuple[str | None, int]]] = {}
+        self.trans: dict[int, list[tuple]] = {}
 
     def new(self) -> int:
         s = self.size
@@ -232,8 +265,9 @@ class _NFA:
         self.trans[s] = []
         return s
 
-    def add(self, src: int, ch: str | None, dst: int):
-        self.trans[src].append((ch, dst))
+    def add(self, src: int, matcher, dst: int):
+        # `matcher` is None (epsilon) or a (frozenset, bool) tuple.
+        self.trans[src].append((matcher, dst))
 
 
 def _build(nfa: _NFA, node) -> tuple[int, int]:
@@ -246,13 +280,17 @@ def _build(nfa: _NFA, node) -> tuple[int, int]:
 
     if isinstance(node, Literal):
         s, a = nfa.new(), nfa.new()
-        nfa.add(s, node.char, a)
+        nfa.add(s, _m_lit(node.char), a)
         return s, a
 
-    if isinstance(node, (CharClass, Dot)):
+    if isinstance(node, CharClass):
         s, a = nfa.new(), nfa.new()
-        for ch in node.matching_chars():
-            nfa.add(s, ch, a)
+        nfa.add(s, _m_cls(node.chars, node.negated), a)
+        return s, a
+
+    if isinstance(node, Dot):
+        s, a = nfa.new(), nfa.new()
+        nfa.add(s, _m_dot(), a)
         return s, a
 
     if isinstance(node, Concat):
@@ -299,30 +337,39 @@ def _build(nfa: _NFA, node) -> tuple[int, int]:
     raise TypeError(f"Unknown AST node: {type(node).__name__}")
 
 # ---------------------------------------------------------------------------
-# DFA  (subset / powerset construction)
+# DFA (subset / powerset construction)
 # ---------------------------------------------------------------------------
 
 class DFA:
-    """Deterministic finite automaton with integer state IDs."""
+    """Deterministic finite automaton with integer state IDs.
 
-    DEAD = -1  # convention for dead / invalid state
+    ``transitions[state]`` maps characters to next states (explicit, literal
+    transitions). ``default_trans[state]`` — if present — is the state taken
+    for *any* character not listed explicitly (wildcard from negated classes).
+    """
 
-    def __init__(self, start: int, trans: dict, accept: frozenset, n_states: int):
+    DEAD = -1
+
+    def __init__(self, start: int, trans: dict, accept: frozenset, n_states: int, default_trans: dict | None = None):
         self.start_state = start
-        self.transitions = trans      # dict[int, dict[str, int]]
-        self.accept_states = accept   # frozenset[int]
+        self.transitions = trans                  # dict[int, dict[str, int]]
+        self.default_trans = default_trans or {}  # dict[int, int]
+        self.accept_states = accept               # frozenset[int]
         self.num_states = n_states
 
     def next_state(self, state: int, ch: str) -> int:
         if state == self.DEAD:
             return self.DEAD
-        return self.transitions.get(state, {}).get(ch, self.DEAD)
+        t = self.transitions.get(state)
+        if t is not None and ch in t:
+            return t[ch]
+        default = self.default_trans.get(state)
+        return self.DEAD if default is None else default
 
     def is_accept(self, state: int) -> bool:
         return state in self.accept_states
 
     def walk(self, state: int, string: str) -> int:
-        """Walk the DFA from *state* through each char in *string*."""
         for ch in string:
             state = self.next_state(state, ch)
             if state == self.DEAD:
@@ -335,30 +382,39 @@ def _epsilon_closure(nfa: _NFA, states: frozenset) -> frozenset:
     closure = set(states)
     while stack:
         s = stack.pop()
-        for ch, ns in nfa.trans.get(s, []):
-            if ch is None and ns not in closure:
+        for matcher, ns in nfa.trans.get(s, []):
+            if matcher is None and ns not in closure:
                 closure.add(ns)
                 stack.append(ns)
     return frozenset(closure)
 
 
-def _nfa_to_dfa(nfa: _NFA, nfa_accept: int) -> DFA:
-    # Gather alphabet from NFA transitions
-    alphabet: set[str] = set()
-    for arcs in nfa.trans.values():
-        for ch, _ in arcs:
-            if ch is not None:
-                alphabet.add(ch)
-
-    start = _epsilon_closure(nfa, frozenset({nfa.trans and 0}))
-    # nfa start is always state 0 by construction in regex_to_dfa
+def _nfa_to_dfa(nfa: _NFA, nfa_accept: int, max_states: int) -> DFA:
     start = _epsilon_closure(nfa, frozenset({0}))
 
     state_map: dict[frozenset, int] = {start: 0}
     dfa_trans: dict[int, dict[str, int]] = {}
+    dfa_default: dict[int, int] = {}
     dfa_accept: set[int] = set()
     queue: deque[frozenset] = deque([start])
     next_id = 1
+
+    def _intern(nfa_states: set) -> int:
+        nonlocal next_id
+        nxt = _epsilon_closure(nfa, frozenset(nfa_states))
+        sid = state_map.get(nxt)
+        if sid is None:
+            if next_id >= max_states:
+                raise ValueError(
+                    f"DFA state explosion: exceeded max_states={max_states}. "
+                    "The schema/regex produces too many DFA states — simplify "
+                    "it or pass a larger ``max_states`` limit."
+                )
+            sid = next_id
+            state_map[nxt] = sid
+            next_id += 1
+            queue.append(nxt)
+        return sid
 
     while queue:
         current = queue.popleft()
@@ -368,22 +424,44 @@ def _nfa_to_dfa(nfa: _NFA, nfa_accept: int) -> DFA:
         if nfa_accept in current:
             dfa_accept.add(cid)
 
-        for ch in alphabet:
-            move: set[int] = set()
-            for s in current:
-                for c, ns in nfa.trans.get(s, []):
-                    if c == ch:
-                        move.add(ns)
-            if not move:
-                continue
-            nxt = _epsilon_closure(nfa, frozenset(move))
-            if nxt not in state_map:
-                state_map[nxt] = next_id
-                next_id += 1
-                queue.append(nxt)
-            dfa_trans[cid][ch] = state_map[nxt]
+        # Collect all non-epsilon outgoing matchers from NFA states in `current`.
+        outgoing: list = []
+        for s in current:
+            for matcher, ns in nfa.trans.get(s, []):
+                if matcher is not None:
+                    outgoing.append((matcher, ns))
 
-    return DFA(0, dfa_trans, frozenset(dfa_accept), next_id)
+        if not outgoing:
+            continue
+
+        # Every char that appears in some matcher gets an explicit transition.
+        # Any other char falls through to the default (wildcard) transition if
+        # at least one matcher is negated.
+        referenced: set = set()
+        has_negated = False
+        for (chars, negated), _ in outgoing:
+            referenced |= chars
+            if negated:
+                has_negated = True
+
+        for ch in referenced:
+            targets = {ns for (chars, neg), ns in outgoing if (ch in chars) != neg}
+            if targets:
+                dfa_trans[cid][ch] = _intern(targets)
+            else:
+                # `ch` is referenced (appears in some matcher's charset) but no
+                # matcher accepts it from this DFA state. Mark it explicitly
+                # DEAD so the default wildcard transition does not fire on it.
+                dfa_trans[cid][ch] = DFA.DEAD
+
+        if has_negated:
+            # A negated matcher with excluded set ⊆ `referenced` matches every
+            # char outside `referenced`. Take the union of all such targets.
+            targets = {ns for (_, neg), ns in outgoing if neg}
+            if targets:
+                dfa_default[cid] = _intern(targets)
+
+    return DFA(0, dfa_trans, frozenset(dfa_accept), next_id, default_trans=dfa_default)
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -394,25 +472,15 @@ def parse_regex(pattern: str):
     return _Parser(tokenize(pattern)).parse()
 
 
-def regex_to_dfa(pattern: str) -> DFA:
-    """Compile a regex pattern into a DFA."""
+def regex_to_dfa(pattern: str, max_states: int = DEFAULT_MAX_STATES) -> DFA:
+    """Compile a regex pattern into a DFA.
+
+    Raises ``ValueError`` if the DFA would exceed ``max_states`` states.
+    """
     ast = parse_regex(pattern)
     nfa = _NFA()
     start, accept = _build(nfa, ast)
-    # Renumber so that start == 0 (needed by _nfa_to_dfa)
-    # Thompson's construction already makes start the first allocated state
-    # when the root is built first, but let's be safe:
-    if start != 0:
-        # Swap state 0 and start in the transition table
-        nfa.trans[0], nfa.trans[start] = nfa.trans[start], nfa.trans[0]
-        # Update references
-        for s in nfa.trans:
-            nfa.trans[s] = [
-                (ch, (0 if ns == start else start if ns == 0 else ns))
-                for ch, ns in nfa.trans[s]
-            ]
-        if accept == 0:
-            accept = start
-        elif accept == start:
-            accept = 0
-    return _nfa_to_dfa(nfa, accept)
+    # Thompson's construction always allocates the start state first, so it is
+    # guaranteed to be state 0. No renumbering is needed.
+    assert start == 0, "Internal error: Thompson NFA start is not state 0"
+    return _nfa_to_dfa(nfa, accept, max_states=max_states)

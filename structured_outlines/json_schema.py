@@ -2,6 +2,10 @@
 
 Supported types: string, integer, number, boolean, null, array, object,
 enum, const, anyOf ($ref / $defs for nested models).
+
+Recursive schemas ($ref cycles) are rejected by design: regular languages
+cannot encode recursive grammars. Restructure the schema to be finite if you
+hit the ``Recursive $ref`` error.
 """
 
 from __future__ import annotations
@@ -15,8 +19,15 @@ from pydantic import BaseModel
 # Primitive-type regex patterns
 # ---------------------------------------------------------------------------
 
-# JSON string: "..." allowing escape sequences
-STRING = r'"([^"\\]|\\.)*"'
+# JSON string per RFC 8259.
+#   Body: any char except `"` and `\` (and control chars < 0x20 in strict JSON,
+#   which we don't exclude here to keep patterns compact — the LLM is very
+#   unlikely to emit raw control bytes inside a string token).
+#   Escape: `\` followed by one of `" \ / b f n r t` or `uXXXX` (4 hex digits).
+_HEX = r"[0-9a-fA-F]"
+STRING = (
+    r'"([^"\\]|\\(["\\/bfnrt]|u' + _HEX + _HEX + _HEX + _HEX + r'))*"'
+)
 
 # JSON integer: 0 | optional-minus non-zero digits
 INTEGER = r'(0|-?[1-9][0-9]*)'
@@ -61,17 +72,27 @@ def _json_literal(value) -> str:
 # Schema → Regex conversion
 # ---------------------------------------------------------------------------
 
-def _convert(schema: dict, defs: dict) -> str:
-    """Recursively convert a JSON-schema node to a regex pattern."""
+def _convert(schema: dict, defs: dict, seen: frozenset = frozenset()) -> str:
+    """Recursively convert a JSON-schema node to a regex pattern.
+
+    ``seen`` carries the set of ``$ref`` names already entered on the current
+    path from the root, so cycles can be rejected with a clear error.
+    """
 
     # ── References ──
     if "$ref" in schema:
         ref_name = schema["$ref"].rsplit("/", 1)[-1]
-        return _convert(defs[ref_name], defs)
+        if ref_name in seen:
+            raise ValueError(
+                f"Recursive $ref detected: '{ref_name}'. Regular expressions "
+                "cannot describe recursive grammars; restructure the schema "
+                "to be finite (e.g., inline the type or bound the depth)."
+            )
+        return _convert(defs[ref_name], defs, seen | {ref_name})
 
     # ── anyOf  (Union / Optional types) ──
     if "anyOf" in schema:
-        options = [_convert(s, defs) for s in schema["anyOf"]]
+        options = [_convert(s, defs, seen) for s in schema["anyOf"]]
         return "(" + "|".join(options) + ")"
 
     # ── enum ──
@@ -101,54 +122,67 @@ def _convert(schema: dict, defs: dict) -> str:
         return NULL
 
     if schema_type == "array":
-        return _array_pattern(schema, defs)
+        return _array_pattern(schema, defs, seen)
 
     if schema_type == "object":
-        return _object_pattern(schema, defs)
+        return _object_pattern(schema, defs, seen)
 
     # Fallback: treat unknown as string
     return STRING
 
 
-def _array_pattern(schema: dict, defs: dict) -> str:
+def _array_pattern(schema: dict, defs: dict, seen: frozenset) -> str:
     item_schema = schema.get("items", {})
-    item = _convert(item_schema, defs)
+    item = _convert(item_schema, defs, seen)
     # [  item (, item)*  ] — or empty []
     inner = item + "(" + WS + "," + WS + item + ")*"
     return r"\[" + WS + "(" + inner + ")?" + WS + r"\]"
 
 
-def _object_pattern(schema: dict, defs: dict) -> str:
+def _object_pattern(schema: dict, defs: dict, seen: frozenset) -> str:
     properties: dict = schema.get("properties", {})
     required: set = set(schema.get("required", []))
 
     if not properties:
         return r"\{" + WS + r"\}"
 
-    parts: list[str] = []
-    first = True
-
+    # Build (pair_pattern, is_required) for each property in declared order.
+    items: list[tuple[str, bool]] = []
     for key, prop_schema in properties.items():
-        value_pat = _convert(prop_schema, defs)
-        # "key" : value
+        value_pat = _convert(prop_schema, defs, seen)
         pair = '"' + _escape_literal(key) + '"' + WS + ":" + WS + value_pat
+        items.append((pair, key in required))
 
-        if first:
-            # First property — no leading comma
-            if key in required:
-                parts.append(WS + pair)
-            else:
-                parts.append("(" + WS + pair + ")?")
-            first = False
+    first_req = next((i for i, (_, r) in enumerate(items) if r), None)
+
+    if first_req is None:
+        # All properties are optional. Any of them may be the first one
+        # emitted (no leading comma); later ones carry a comma.
+        alternatives: list[str] = []
+        for i in range(len(items)):
+            pat = items[i][0]
+            for j in range(i + 1, len(items)):
+                pat += "(" + WS + "," + WS + items[j][0] + ")?"
+            alternatives.append(pat)
+        body = "(" + "|".join(alternatives) + ")?"
+        return r"\{" + WS + body + WS + r"\}"
+
+    # At least one required property exists — anchor the regex on the first
+    # required one. Optional properties before it emit "(pair, )?"; optional
+    # properties after it emit "(, pair)?"; required ones after emit ", pair".
+    parts: list[str] = []
+    for i in range(first_req):
+        pair, _ = items[i]
+        parts.append("(" + pair + WS + "," + WS + ")?")
+    parts.append(items[first_req][0])
+    for i in range(first_req + 1, len(items)):
+        pair, req = items[i]
+        if req:
+            parts.append(WS + "," + WS + pair)
         else:
-            if key in required:
-                # If previous part was optional, comma must be conditional too.
-                # Simplification: always emit comma (all props appear in order).
-                parts.append(WS + "," + WS + pair)
-            else:
-                parts.append("(" + WS + "," + WS + pair + ")?")
+            parts.append("(" + WS + "," + WS + pair + ")?")
 
-    return r"\{" + "".join(parts) + WS + r"\}"
+    return r"\{" + WS + "".join(parts) + WS + r"\}"
 
 # ---------------------------------------------------------------------------
 # Public API
