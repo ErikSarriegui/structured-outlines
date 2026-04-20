@@ -57,5 +57,36 @@ print(json_output)
 * `guide.py`: DFA-based token transition mapping (~95 lines).
 * `generate.py`: Hugging Face integration and Logits processing (~140 lines).
 
+## ✅ Schema Features
+
+Only **structural** constraints are enforced at the DFA level during generation. Value-level constraints are checked **after** generation by `pydantic.model_validate_json`, which raises if the output is out of bounds.
+
+**Enforced by the DFA (token-level guarantee):**
+* Types: `str`, `int`, `float`, `bool`, `None`
+* `enum`, `const`, `anyOf` / `Optional[...]` / `Union[...]`
+* `array` (`List[...]`), `object` (nested `BaseModel`), `$ref` to non-recursive `$defs`
+* Object property order, `required` vs optional presence
+
+**NOT enforced by the DFA** (validated post-hoc by Pydantic only):
+* String: `pattern`, `min_length`, `max_length`, `format` (email, uuid, etc.)
+* Numeric: `ge`, `le`, `gt`, `lt`, `multiple_of`
+* Array: `min_items`, `max_items`, `unique_items`
+* Number exponential notation (`1e5`) — the DFA accepts only decimal form
+
+If your schema relies on these for correctness, expect occasional `ValidationError` at the end of generation. For a batch of N items, plan to retry or drop failures. If you need these guarantees at the token level, this library is not the right tool.
+
+## ⚠️ Disclaimer — When NOT to Use This Library
+
+**Structured Outlines** is intentionally small and trusting. It was designed for environments where a developer is the only user, dependencies are restricted, and auditability beats feature completeness. **Do not use it in the following scenarios:**
+
+* **User-facing / multi-tenant systems.** The library assumes the `schema` and `prompt` come from a trusted developer. It is not hardened against adversarially crafted schemas (deeply nested `anyOf`, pathological `$ref` graphs) beyond the default DFA state cap. Production APIs exposed to end users should use a mature library (`outlines`, `guidance`, `lm-format-enforcer`, or vendor-native structured output).
+* **High-throughput production inference.** `RegexGuide` precomputes transitions for every (state, token) pair. For large vocabularies (>100k) combined with complex schemas, startup cost and memory footprint are significant. There is no caching across calls.
+* **Schemas requiring value-level validation at the token level.** See *Schema Features* above. If `pattern`, length bounds, or numeric ranges must be guaranteed during decoding (not after), use a library that supports them natively.
+* **Beam search decoding.** Only `batch_size == 1` with greedy or sampling is supported. Beam search is rejected explicitly because only the first beam would be constrained.
+* **Recursive schemas.** Regular languages cannot describe recursive grammars. Self-referencing `$ref` cycles are rejected with a clear error — restructure or bound the depth.
+* **Safety-critical outputs.** Structural validity is not semantic correctness. A schema-valid JSON can still be factually wrong, toxic, or leak data. Apply the usual LLM output review on top.
+
+If your use case is *"I need to classify 10k texts tonight on Colab without installing anything my security team hasn't already vetted"* — this library is for you. If it isn't, pick a production-grade alternative.
+
 ## 📝 License
 Distributed under the **Apache License 2.0**.
